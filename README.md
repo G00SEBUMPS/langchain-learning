@@ -28,7 +28,8 @@ source .venv/bin/activate  # On Windows, use `.venv\Scripts\activate`
 
 3. Install dependencies:
 ```bash
-pip install -r requirements.txt
+pip install uv
+uv sync 
 ```
 
 ## Project Structure
@@ -48,7 +49,7 @@ Feel free to fork this repository and submit pull requests for any improvements.
 
 ## License
 
-[Add your chosen license here]
+MIT Open Source License
 
 ## Contact
 
