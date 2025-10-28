@@ -1,12 +1,156 @@
 from itertools import chain
 import os
 from dotenv import load_dotenv
+import requests
+import time
+import threading
+import functools
+import concurrent.futures
 from langchain_core.prompts import PromptTemplate
-from langchain_openai import OpenAI
+from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
+import os
+
 load_dotenv()
+
+
+# --- Resilience helpers: simple circuit breaker + timeout decorator ---
+class CircuitBreakerError(RuntimeError):
+    pass
+
+
+class CircuitBreaker:
+    """A very small in-process circuit breaker.
+
+    Parameters:
+      failure_threshold: number of consecutive failures to open the circuit
+      recovery_timeout: seconds to wait before attempting a half-open trial
+      expected_exception: exception or tuple of exceptions that count as failures
+    """
+
+    def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 30.0, expected_exception=Exception):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.expected_exception = expected_exception
+        self._failure_count = 0
+        self._state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+        self._opened_since = None
+        self._lock = threading.Lock()
+
+    def _open(self):
+        self._state = "OPEN"
+        self._opened_since = time.monotonic()
+
+    def _close(self):
+        self._state = "CLOSED"
+        self._failure_count = 0
+        self._opened_since = None
+
+    def _maybe_transition(self):
+        if self._state == "OPEN" and self._opened_since is not None:
+            if time.monotonic() - self._opened_since >= self.recovery_timeout:
+                self._state = "HALF_OPEN"
+
+    def call(self, func, *args, **kwargs):
+        with self._lock:
+            self._maybe_transition()
+            if self._state == "OPEN":
+                raise CircuitBreakerError("Circuit is open; skipping call")
+
+        try:
+            result = func(*args, **kwargs)
+        except self.expected_exception as e:
+            with self._lock:
+                self._failure_count += 1
+                if self._failure_count >= self.failure_threshold:
+                    self._open()
+            raise
+        else:
+            with self._lock:
+                # on success, if half-open then close; reset failure count
+                if self._state in ("HALF_OPEN", "OPEN"):
+                    self._close()
+                else:
+                    self._failure_count = 0
+            return result
+
+    def __call__(self, func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            return self.call(func, *args, **kwargs)
+
+        return wrapper
+
+
+def timed(timeout: float):
+    """Decorator to run a function in a thread and raise TimeoutError on timeout."""
+
+    def deco(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(func, *args, **kwargs)
+                try:
+                    return fut.result(timeout=timeout)
+                except concurrent.futures.TimeoutError as e:
+                    # cancel is best-effort; underlying thread may continue until completion
+                    fut.cancel()
+                    raise TimeoutError(f"Function call timed out after {timeout} seconds") from e
+
+        return wrapper
+
+    return deco
+
+
+# configure a circuit breaker for local-ollama checks and LLM invokes
+_OLLAMA_CB = CircuitBreaker(failure_threshold=3, recovery_timeout=20.0, expected_exception=Exception)
+_LLM_CB = CircuitBreaker(failure_threshold=2, recovery_timeout=30.0, expected_exception=Exception)
+
+
+@_OLLAMA_CB
+@timed(2.0)
+def detect_local_ollama(port: int = 11434, timeout: float = 1.5) -> str | None:
+    """Try to detect a local Ollama HTTP server.
+
+    Returns the base URL if found (e.g. 'http://localhost:11434'), otherwise None.
+    The function will try a couple of likely endpoints and return as soon as one responds.
+    """
+    host = "http://localhost"
+    base = f"{host}:{port}"
+    candidates = ["/v1/models", "/ping", "/"]
+    for path in candidates:
+        try:
+            url = base + path
+            resp = requests.get(url, timeout=timeout)
+            # any 2xx/3xx/4xx response means something is listening there
+            if resp.status_code >= 200:
+                return base
+        except requests.RequestException:
+            continue
+    return None
+ 
+
+
+
 def main():
     print("Hello from langchain-learning!")
     print(f"API Key: {os.getenv('OPENAI_API_KEY')}")
+
+    # Determine Ollama base URL: prefer explicit env var, otherwise try localhost detection
+    ollama_env = os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_HOST")
+    if ollama_env:
+        print(f"Using Ollama base URL from environment: {ollama_env}")
+        ollama_base = ollama_env
+    else:
+        detected = detect_local_ollama()
+        if detected:
+            ollama_base = detected
+            # export for libraries that read env vars
+            os.environ.setdefault("OLLAMA_URL", ollama_base)
+            print(f"Detected local Ollama at {ollama_base}; set OLLAMA_URL environment variable.")
+        else:
+            ollama_base = None
+            print("No local Ollama detected (tried http://localhost:11434). If you run Ollama locally, set OLLAMA_URL env var to point at it.")
     information = """
 Sachin Ramesh Tendulkar (/ˌsʌtʃɪn tɛnˈduːlkər/ ⓘ; Marathi: [sətɕin t̪eɳɖulkəɾ]; born 24 April 1973) is an Indian former international cricketer who captained the Indian national team. Often dubbed the "God of Cricket" in India, he is widely regarded as one of the greatest cricketers of all time as well as one of the greatest batsmen of all time.[5] He holds several world records, including being the all-time highest run-scorer in cricket,[6] receiving the most player of the match awards in international cricket,[7] and being the only batsman to score 100 international centuries.[8] Tendulkar was a Member of Parliament, Rajya Sabha by presidential nomination from 2012 to 2018.[9][10]
 
@@ -83,10 +227,55 @@ Now write the four sections.
         input_variables=["information"],
         template=summary_template,
     )
-    llm = OpenAI(temperature=0,model="gpt-4o-mini")
+    #llm = ChatOpenAI(temperature=0,model="gpt-4o-mini")
+    # Try to pass the detected base url to ChatOllama if the client supports it.
+    if ollama_base:
+        try:
+            llm = ChatOllama(temperature=0, model="gemma3:latest", base_url=ollama_base,num_ctx=16834, model_kwargs={
+        "gpu_layers": 16,          # how many transformer layers on GPU
+        "num_ctx": 16384,          # 8k–32k is a good default
+        "num_thread": os.cpu_count(),
+        "num_predict": 512,
+        "keep_alive": "30m",
+        "num_gpu": 1               # optional; single-GPU box
+    })
+        except TypeError:
+            # Some versions of the client may not accept base_url param; rely on OLLAMA_URL env var instead
+            llm = ChatOllama(temperature=0, model="gemma3:latest",num_ctx=16834, model_kwargs={
+        "gpu_layers": 16,          # how many transformer layers on GPU
+        "num_ctx": 16384,          # 8k–32k is a good default
+        "num_thread": os.cpu_count(),
+        "num_predict": 512,
+        "keep_alive": "30m",
+        "num_gpu": 1               # optional; single-GPU box
+    })
+    else:
+        llm = ChatOllama(temperature=0, model="gemma3:latest",num_ctx=16834, model_kwargs={
+        "gpu_layers": 16,          # how many transformer layers on GPU
+        "num_ctx": 16384,          # 8k–32k is a good default
+        "num_thread": os.cpu_count(),
+        "num_predict": 512,
+        "keep_alive": "30m",
+        "num_gpu": 1               # optional; single-GPU box
+    })
+
     llm_prompt = summary_prompt_template | llm
-    summary = llm_prompt.invoke(input={"information": information})
+
+    @timed(20.0)
+    @_LLM_CB
+    def _invoke(prompt, input_dict):
+        print("Invoking LLM...")
+        return prompt.invoke(input=input_dict)
+
+    try:
+        summary = _invoke(llm_prompt, {"information": information})
+    except CircuitBreakerError as e:
+        summary = f"LLM circuit open or prevented call: {e}"
+    except TimeoutError as e:
+        summary = f"LLM invocation timed out: {e}"
+    except Exception as e:
+        summary = f"LLM invocation failed: {e}"
     print("Summary:")
-    print(summary)
+    print(summary.content)
 if __name__ == "__main__":
     main()
