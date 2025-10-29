@@ -29,11 +29,19 @@ tools = [TavilySearch()]
 llm = ChatOllama(model="gemma3:latest", temperature=0, num_ctx=128000)
 #react_prompt = hub.pull("hwchase17/react")
 output_parser = PydanticOutputParser(pydantic_object=AgentResponse)
+structured_llm = llm.with_structured_output(AgentResponse)
+# react_prompt = PromptTemplate(
+#     template=REACT_PROMPT_WITH_FORMAT_INSTRUCTIONS,
+#     input_variables=["input","agent_scratchpad","tool_names"]
+#     ).partial(format_instructions = output_parser.get_format_instructions())
+#agent = create_react_agent(llm=llm, tools=tools, prompt=react_prompt)
+
 react_prompt = PromptTemplate(
     template=REACT_PROMPT_WITH_FORMAT_INSTRUCTIONS,
     input_variables=["input","agent_scratchpad","tool_names"]
-    ).partial(format_instructions = output_parser.get_format_instructions())
+    ).partial(format_instructions = "")
 agent = create_react_agent(llm=llm, tools=tools, prompt=react_prompt)
+
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 chain = agent_executor
 extract_output = RunnableLambda(
@@ -42,13 +50,14 @@ extract_output = RunnableLambda(
 parse_output = RunnableLambda(
     lambda x: output_parser.parse(x)
 )
-chain = agent_executor | extract_output | parse_output
+# chain = agent_executor | extract_output | parse_output
+chain = agent_executor | extract_output | structured_llm
 def main():
     os.environ["LANGSMITH_PROJECT"] = "Search Agent Project"
     print("Hello Search Agent")
     result = chain.invoke(
         input={
-            "input": "search for 3 best gaming keyboards in India that needs to be mechanical include result form meckeys also get therie rpices and compare it on amazon also."
+            "input": "search for 3 best gaming keyboards in India that needs to be mechanical."
         }
     )
     #Getting Agent Response type promatically from output parser

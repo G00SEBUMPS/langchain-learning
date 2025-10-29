@@ -14,7 +14,6 @@ Observation: the result of the action
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question fromatted according to format_instructions : {format_instructions}
 
-IMPORTANT: Write the Action name WITHOUT any brackets or special characters. Just write the tool name directly.
 
 Begin!
 
