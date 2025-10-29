@@ -36,8 +36,13 @@ react_prompt = PromptTemplate(
 agent = create_react_agent(llm=llm, tools=tools, prompt=react_prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 chain = agent_executor
-
-
+extract_output = RunnableLambda(
+    lambda x: x["output"]
+)
+parse_output = RunnableLambda(
+    lambda x: output_parser.parse(x)
+)
+chain = agent_executor | extract_output | parse_output
 def main():
     os.environ["LANGSMITH_PROJECT"] = "Search Agent Project"
     print("Hello Search Agent")
@@ -47,7 +52,8 @@ def main():
         }
     )
     #Getting Agent Response type promatically from output parser
-    print("Agent Response:", output_parser.parse_result(result["output"]))
+    #print("Agent Response:", output_parser.parse_result(result["output"]))
+    print("Agent Response:", result)
 
 if __name__ == "__main__":
     main()
